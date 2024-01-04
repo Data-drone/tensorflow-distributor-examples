@@ -14,6 +14,9 @@
 
 # COMMAND ----------
 
+dbutils.library.restartPython()
+# COMMAND ----------
+
 from tensorflow import keras
 from transformers import TFSamModel, SamProcessor
 import numpy as np
@@ -136,107 +139,107 @@ def dice_loss(y_true, y_pred, smooth=1e-5):
 def wrapped_train_loop(global_batch_size:int=2):
 
     mlflow.set_experiment(experiment_path)
-    active_run = mlflow.start_run(run_name='SAM Model', log_system_metrics=True)
-    
-    learning_rate = 1e-5
+    #active_run = mlflow.start_run(run_name='SAM Model', log_system_metrics=True)
+    with mlflow.start_run(run_name='wrapped sam'):
+        learning_rate = 1e-5
 
-    mlflow.log_params({'learning_rate': learning_rate})
+        mlflow.log_params({'learning_rate': learning_rate})
 
     # 1) Add Strategy
-    strategy = tf.distribute.MirroredStrategy()
+        strategy = tf.distribute.MirroredStrategy()
 
     # 2) Wrap the Model and Optimizer
-    with strategy.scope():
-        model = TFSamModel.from_pretrained("facebook/sam-vit-base")
-        processor = SamProcessor.from_pretrained("facebook/sam-vit-base")
-        optimizer = keras.optimizers.Adam(learning_rate)
+        with strategy.scope():
+            model = TFSamModel.from_pretrained("facebook/sam-vit-base")
+            processor = SamProcessor.from_pretrained("facebook/sam-vit-base")
+            optimizer = keras.optimizers.Adam(learning_rate)
 
         # for saving model checkpoints
-        checkpoint = tf.train.Checkpoint(optimizer=optimizer, model=model)
+            checkpoint = tf.train.Checkpoint(optimizer=optimizer, model=model)
 
 
-    output_signature = {
-        "pixel_values": tf.TensorSpec(shape=(3, None, None), dtype=tf.float32),
-        "original_sizes": tf.TensorSpec(shape=(None,), dtype=tf.int64),
-        "reshaped_input_sizes": tf.TensorSpec(shape=(None,), dtype=tf.int64),
-        "input_boxes": tf.TensorSpec(shape=(None, None), dtype=tf.float64),
-        "ground_truth_mask": tf.TensorSpec(shape=(None, None), dtype=tf.int32),
-    }
+        output_signature = {
+            "pixel_values": tf.TensorSpec(shape=(3, None, None), dtype=tf.float32),
+            "original_sizes": tf.TensorSpec(shape=(None,), dtype=tf.int64),
+            "reshaped_input_sizes": tf.TensorSpec(shape=(None,), dtype=tf.int64),
+            "input_boxes": tf.TensorSpec(shape=(None, None), dtype=tf.float64),
+            "ground_truth_mask": tf.TensorSpec(shape=(None, None), dtype=tf.int32),
+        }
 
     # Prepare the dataset object.
-    train_dataset_gen = Generator(dataset_path, processor)
-    train_ds = tf.data.Dataset.from_generator(
-        train_dataset_gen, output_signature=output_signature
-    )
+        train_dataset_gen = Generator(dataset_path, processor)
+        train_ds = tf.data.Dataset.from_generator(
+            train_dataset_gen, output_signature=output_signature
+        )
 
-    shuffle_buffer = 4
+        shuffle_buffer = 4
 
-    train_ds = (
-        train_ds.cache()
-        .shuffle(shuffle_buffer)
-        .batch(global_batch_size)
-        #.prefetch(buffer_size=auto)
-    )
+        train_ds = (
+            train_ds.cache()
+            .shuffle(shuffle_buffer)
+            .batch(global_batch_size)
+            #.prefetch(buffer_size=auto)
+        )
 
-    mlflow_dataset = mlflow.data.tensorflow_dataset.from_tensorflow(
-        features=train_ds, name='breast-cancer-dataset'
-    )
+        mlflow_dataset = mlflow.data.tensorflow_dataset.from_tensorflow(
+            features=train_ds, name='breast-cancer-dataset'
+        )
 
-    mlflow.log_input(mlflow_dataset, context="training")
+        mlflow.log_input(mlflow_dataset, context="training")
 
     # 3) Distribute the dataset
-    dist_dataset = strategy.experimental_distribute_dataset(train_ds)
+        dist_dataset = strategy.experimental_distribute_dataset(train_ds)
     
     # do we need to change this
     
-    for layer in model.layers:
-        if layer.name in ["vision_encoder", "prompt_encoder"]:
-            layer.trainable = False
+        for layer in model.layers:
+            if layer.name in ["vision_encoder", "prompt_encoder"]:
+                layer.trainable = False
 
 
     #@tf.function
-    def train_step(inputs):
-        with tf.GradientTape() as tape:
-            # pass inputs to SAM model
-            outputs = model(
-                pixel_values=inputs["pixel_values"],
-                input_boxes=inputs["input_boxes"],
-                multimask_output=False,
-                training=True,
-            )
+        def train_step(inputs):
+            with tf.GradientTape() as tape:
+                # pass inputs to SAM model
+                outputs = model(
+                    pixel_values=inputs["pixel_values"],
+                    input_boxes=inputs["input_boxes"],
+                    multimask_output=False,
+                    training=True,
+                )
 
-            predicted_masks = tf.squeeze(outputs.pred_masks, 1)
-            ground_truth_masks = tf.cast(inputs["ground_truth_mask"], tf.float32)
+                predicted_masks = tf.squeeze(outputs.pred_masks, 1)
+                ground_truth_masks = tf.cast(inputs["ground_truth_mask"], tf.float32)
 
-            # calculate loss over predicted and ground truth masks
-            loss = dice_loss(tf.expand_dims(ground_truth_masks, 1), predicted_masks)
-            # update trainable variables
-            trainable_vars = model.trainable_variables
-        grads = tape.gradient(loss, trainable_vars)
-        optimizer.apply_gradients(zip(grads, trainable_vars))
+                # calculate loss over predicted and ground truth masks
+                loss = dice_loss(tf.expand_dims(ground_truth_masks, 1), predicted_masks)
+                # update trainable variables
+                trainable_vars = model.trainable_variables
+            grads = tape.gradient(loss, trainable_vars)
+            optimizer.apply_gradients(zip(grads, trainable_vars))
 
-        return loss
+            return loss
     
     # 4) Wrap the train function in a distribution mechanism
     ## The reduce step is to aggregate the losses from across the different shards
-    @tf.function
-    def distributed_train_step(dist_inputs):
-        per_replica_losses = strategy.run(train_step, args=(dist_inputs,))
-        return strategy.reduce(tf.distribute.ReduceOp.SUM, per_replica_losses,
-                         axis=None)
+        @tf.function
+        def distributed_train_step(dist_inputs):
+            per_replica_losses = strategy.run(train_step, args=(dist_inputs,))
+            return strategy.reduce(tf.distribute.ReduceOp.SUM, per_replica_losses,
+                             axis=None)
 
     
-    for epoch in range(3):
-        for step, inputs in enumerate(dist_dataset):
-            loss = distributed_train_step(inputs)
-            mlflow.log_metrics({'loss': loss}, step=step)
-        print(f"Epoch {epoch + 1}: Loss = {loss}")
+        for epoch in range(3):
+            for step, inputs in enumerate(dist_dataset):
+                loss = distributed_train_step(inputs)
+                mlflow.log_metrics({'loss': loss}, step=step)
+            print(f"Epoch {epoch + 1}: Loss = {loss}")
 
-        checkpoint.save(checkpoint_prefix)
+            checkpoint.save(checkpoint_prefix)
 
-    mlflow.tensorflow.save_model(model, 'dbfs:/databricks/mlflow-tracking/4225188182853316')
+        mlflow.tensorflow.log_model(model, 'model')
 
-    mlflow.end_run()
+    #mlflow.end_run()
 
 # COMMAND ----------
         
