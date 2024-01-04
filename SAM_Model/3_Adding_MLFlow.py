@@ -1,15 +1,18 @@
 # Databricks notebook source
 # MAGIC %md
 # MAGIC
-# MAGIC # Scaling the Segment Anything Model with Tensorflow
+# MAGIC # Tensorflow Logging and Monitoring
 # MAGIC Based on: https://keras.io/examples/vision/sam/
 # MAGIC
-# MAGIC Migrating to Distributed
 # MAGIC
-# MAGIC Scenario 1 - Multi-GPU Single Node
+# MAGIC We will now add mlflow
 
 # COMMAND ----------
 
+# MAGIC # We want all the latest mlflow features
+# MAGIC %pip install mlflow==2.9.2 pynvml
+
+# COMMAND ----------
 
 from tensorflow import keras
 from transformers import TFSamModel, SamProcessor
@@ -18,6 +21,24 @@ import tensorflow as tf
 from PIL import Image
 import glob
 import os
+
+import mlflow
+
+# COMMAND ----------
+
+# Logging Setup
+# Databricks configuration and MLflow setup
+browser_host = spark.conf.get("spark.databricks.workspaceUrl")
+db_host = f"https://{browser_host}"
+db_token = dbutils.notebook.entry_point.getDbutils().notebook().getContext().apiToken().get()
+
+# MLflow configuration
+username = spark.sql("SELECT current_user()").first()['current_user()']
+experiment_path = f'/Users/{username}/scaling-tensorflow'
+
+# Model Checkpoint Dir
+checkpoint_dir = '/local_disk0/training_checkpoints'
+checkpoint_prefix = os.path.join(checkpoint_dir, "ckpt")
 
 # COMMAND ----------
 
@@ -114,6 +135,13 @@ def dice_loss(y_true, y_pred, smooth=1e-5):
 
 def wrapped_train_loop(global_batch_size:int=2):
 
+    mlflow.set_experiment(experiment_path)
+    active_run = mlflow.start_run(run_name='SAM Model', log_system_metrics=True)
+    
+    learning_rate = 1e-5
+
+    mlflow.log_params({'learning_rate': learning_rate})
+
     # 1) Add Strategy
     strategy = tf.distribute.MirroredStrategy()
 
@@ -121,7 +149,11 @@ def wrapped_train_loop(global_batch_size:int=2):
     with strategy.scope():
         model = TFSamModel.from_pretrained("facebook/sam-vit-base")
         processor = SamProcessor.from_pretrained("facebook/sam-vit-base")
-        optimizer = keras.optimizers.Adam(1e-5)
+        optimizer = keras.optimizers.Adam(learning_rate)
+
+        # for saving model checkpoints
+        checkpoint = tf.train.Checkpoint(optimizer=optimizer, model=model)
+
 
     output_signature = {
         "pixel_values": tf.TensorSpec(shape=(3, None, None), dtype=tf.float32),
@@ -145,6 +177,12 @@ def wrapped_train_loop(global_batch_size:int=2):
         .batch(global_batch_size)
         #.prefetch(buffer_size=auto)
     )
+
+    mlflow_dataset = mlflow.data.tensorflow_dataset.from_tensorflow(
+        features=train_ds, name='breast-cancer-dataset'
+    )
+
+    mlflow.log_input(mlflow_dataset, context="training")
 
     # 3) Distribute the dataset
     dist_dataset = strategy.experimental_distribute_dataset(train_ds)
@@ -187,10 +225,18 @@ def wrapped_train_loop(global_batch_size:int=2):
         return strategy.reduce(tf.distribute.ReduceOp.SUM, per_replica_losses,
                          axis=None)
 
+    
     for epoch in range(3):
-        for inputs in dist_dataset:
+        for step, inputs in enumerate(dist_dataset):
             loss = distributed_train_step(inputs)
+            mlflow.log_metrics({'loss': loss}, step=step)
         print(f"Epoch {epoch + 1}: Loss = {loss}")
+
+        checkpoint.save(checkpoint_prefix)
+
+    mlflow.tensorflow.save_model(model, 'dbfs:/databricks/mlflow-tracking/4225188182853316')
+
+    mlflow.end_run()
 
 # COMMAND ----------
         
