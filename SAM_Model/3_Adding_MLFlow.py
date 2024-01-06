@@ -127,10 +127,13 @@ def dice_loss(y_true, y_pred, smooth=1e-5):
 # MAGIC For advanced training code, we need to wrap it in a train loop and make some changes
 # MAGIC
 # MAGIC Core Changes:
-# MAGIC - 1) Add the Strategy Line - Here we choose Mirror
-# MAGIC - 2) wrapping the model and optimizer in the strategy
-# MAGIC - 3) Distribute the dataset
-# MAGIC - 4) Wrap the original train loop with a distribution mechanism
+# MAGIC - 1) Set Experiment (Optional but good for consistency)
+# MAGIC - 2) Wrap with start run - Note the new (MLflow 2.8 onwards) system metrics
+# MAGIC - 3) Log Training Parameters
+# MAGIC - 4) Log mlflow dataset for traceability
+# MAGIC - 5) Log Metrics
+# MAGIC - 6) Log Model to Artifact Store
+# MAGIC TODO Fix the signature
 
 # COMMAND ----------
 
@@ -138,23 +141,26 @@ def dice_loss(y_true, y_pred, smooth=1e-5):
 
 def wrapped_train_loop(global_batch_size:int=2):
 
+    # 1) Set Experiment
     mlflow.set_experiment(experiment_path)
-    #active_run = mlflow.start_run(run_name='SAM Model', log_system_metrics=True)
-    with mlflow.start_run(run_name='wrapped sam'):
+
+    # 2) Wrap with start run
+    with mlflow.start_run(run_name='wrapped sam', log_system_metrics=True):
+
         learning_rate = 1e-5
 
-        mlflow.log_params({'learning_rate': learning_rate})
-
-    # 1) Add Strategy
+        # 3) Log Training Parameters
+        mlflow.log_params({'learning_rate': learning_rate,
+                           'global_batch_size': global_batch_size})
+    
         strategy = tf.distribute.MirroredStrategy()
 
-    # 2) Wrap the Model and Optimizer
         with strategy.scope():
             model = TFSamModel.from_pretrained("facebook/sam-vit-base")
             processor = SamProcessor.from_pretrained("facebook/sam-vit-base")
             optimizer = keras.optimizers.Adam(learning_rate)
 
-        # for saving model checkpoints
+            # for saving model checkpoints
             checkpoint = tf.train.Checkpoint(optimizer=optimizer, model=model)
 
 
@@ -166,7 +172,7 @@ def wrapped_train_loop(global_batch_size:int=2):
             "ground_truth_mask": tf.TensorSpec(shape=(None, None), dtype=tf.int32),
         }
 
-    # Prepare the dataset object.
+        # Prepare the dataset object.
         train_dataset_gen = Generator(dataset_path, processor)
         train_ds = tf.data.Dataset.from_generator(
             train_dataset_gen, output_signature=output_signature
@@ -181,23 +187,20 @@ def wrapped_train_loop(global_batch_size:int=2):
             #.prefetch(buffer_size=auto)
         )
 
+        
+        # 4) Log mlflow dataset for traceability
         mlflow_dataset = mlflow.data.tensorflow_dataset.from_tensorflow(
             features=train_ds, name='breast-cancer-dataset'
         )
 
         mlflow.log_input(mlflow_dataset, context="training")
 
-    # 3) Distribute the dataset
         dist_dataset = strategy.experimental_distribute_dataset(train_ds)
-    
-    # do we need to change this
-    
+        
         for layer in model.layers:
             if layer.name in ["vision_encoder", "prompt_encoder"]:
                 layer.trainable = False
 
-
-    #@tf.function
         def train_step(inputs):
             with tf.GradientTape() as tape:
                 # pass inputs to SAM model
@@ -232,12 +235,46 @@ def wrapped_train_loop(global_batch_size:int=2):
         for epoch in range(3):
             for step, inputs in enumerate(dist_dataset):
                 loss = distributed_train_step(inputs)
+
+                # 5) Log Metrics
                 mlflow.log_metrics({'loss': loss}, step=step)
             print(f"Epoch {epoch + 1}: Loss = {loss}")
 
             checkpoint.save(checkpoint_prefix)
 
-        mlflow.tensorflow.log_model(model, 'model')
+        # Generate Model Signature
+        from mlflow.types.schema import Schema, TensorSpec
+        from mlflow.models import ModelSignature
+        import numpy as np
+        import requests
+
+        input_schema = Schema(
+            [
+                TensorSpec(np.dtype(np.float64), (-1, 3, -1, -1), "pixel_values"),
+                TensorSpec(np.dtype(np.uint64), (-1, 1, 2), "original_sizes"),
+                TensorSpec(np.dtype(np.uint64), (-1, 1, 2), "reshaped_input_sizes"),
+                TensorSpec(np.dtype(np.float64), (-1, -1, -1, -1, -1), "input_points"),
+            ]
+        )
+
+        output_schema = Schema(
+            [
+                TensorSpec(np.dtype(np.float64), (-1, 3, -1, -1), "iou_scores"),
+                TensorSpec(np.dtype(np.float64), (-1, 3, -1, -1), "pred_masks"),
+            ]
+        )
+
+        # Setting up example data
+        raw_image = Image.open(requests.get("https://huggingface.co/ybelkada/segment-anything/resolve/main/assets/car.png", 
+                                            stream=True).raw).convert("RGB")
+        inputs = processor(raw_image, input_points=[[[450, 600]]], return_tensors="pt")
+
+        signature = ModelSignature(inputs=input_schema, outputs=output_schema)
+
+        # 6) Log Model to Artifact Store
+        mlflow.tensorflow.log_model(model, 'model',
+                                    signature = signature,
+                                    input_example = inputs)
 
     #mlflow.end_run()
 
