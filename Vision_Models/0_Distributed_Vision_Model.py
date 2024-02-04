@@ -1,12 +1,12 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # Using TF Model Zoo
+# MAGIC # Vision Models using TF Model Zoo
 # MAGIC Based on: https://www.tensorflow.org/tutorials/images/transfer_learning
 
 # COMMAND ----------
 
 # MAGIC # We want all the latest mlflow features
-# MAGIC %pip install mlflow==2.9.2 pynvml
+# MAGIC %pip install mlflow==2.10.0 pynvml
 
 # COMMAND ----------
 
@@ -14,10 +14,12 @@ dbutils.library.restartPython()
 
 # COMMAND ----------
 
+# MAGIC %run ../utils/mlflow_dist_utils
+# COMMAND ----------
+
 import os
 import tensorflow as tf
 import mlflow
-from mlflow.utils.mlflow_tags import MLFLOW_PARENT_RUN_ID 
 
 # COMMAND ----------
 
@@ -118,25 +120,6 @@ def build_datasets(train_dir: str, validation_dir: str, batch_size, image_size):
     return train_dataset, validation_dataset, test_dataset
 
 
-def detect_lead_process(strategy, gpus_per_node):
-
-    # In order to log system stats on all workers we need to
-    # - make sure to run system stats logging only once per machine
-    # - ensure that param logging just happens on the chief node
-    
-    task_id = strategy.cluster_resolver.task_id
-
-    if task_id == 0:
-        chief = True
-        lead_process = True
-        return chief, lead_process
-    elif gpus_per_node:
-        return False, True
-    elif task_id & gpus_per_node == 0:
-        return False, True
-    else:
-        return False, False 
-    
 def wrapped_train_loop(gpus_per_node:int, parent_run_id:str=None):
 
     mlflow.set_experiment(experiment_path)
@@ -158,17 +141,7 @@ def wrapped_train_loop(gpus_per_node:int, parent_run_id:str=None):
 
     is_chief, is_lead_process = detect_lead_process(strategy, gpus_per_node)
 
-    if is_chief and is_lead_process:
-        active_run = mlflow.start_run(run_name='chief_process', 
-                                      log_system_metrics=True,
-                                      tags = {MLFLOW_PARENT_RUN_ID: parent_run_id})
-        mlflow.tensorflow.autolog()
-
-    elif is_lead_process:
-        active_run = mlflow.start_run(run_name='child_process', 
-                                      log_system_metrics=True,
-                                      tags = {MLFLOW_PARENT_RUN_ID: parent_run_id})
-        mlflow.tensorflow.autolog(disable=True)
+    active_run = create_mlflow_run(is_chief, is_lead_process, parent_run_id)
 
     # We need to change batching for train vs validation and test
     train_dataset, validation_dataset, test_dataset = build_datasets(train_dir, validation_dir,
@@ -186,7 +159,7 @@ def wrapped_train_loop(gpus_per_node:int, parent_run_id:str=None):
     model.fit(dist_train,
               epochs = TOTAL_EPOCHS,
               validation_data = validation_dataset,
-              steps_per_epoch  = 10) # To Work out
+              steps_per_epoch  = 10) # TODO Write some code to work out actual steps needed
     
 # COMMAND ----------
     

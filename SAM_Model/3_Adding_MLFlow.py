@@ -10,7 +10,7 @@
 # COMMAND ----------
 
 # MAGIC # We want all the latest mlflow features
-# MAGIC %pip install mlflow==2.9.2 pynvml
+# MAGIC %pip install mlflow==2.10.0 pynvml
 
 # COMMAND ----------
 
@@ -30,10 +30,6 @@ import mlflow
 # COMMAND ----------
 
 # Logging Setup
-# Databricks configuration and MLflow setup
-browser_host = spark.conf.get("spark.databricks.workspaceUrl")
-db_host = f"https://{browser_host}"
-db_token = dbutils.notebook.entry_point.getDbutils().notebook().getContext().apiToken().get()
 
 # MLflow configuration
 username = spark.sql("SELECT current_user()").first()['current_user()']
@@ -264,19 +260,12 @@ def wrapped_train_loop(global_batch_size:int=2):
             ]
         )
 
-        # Setting up example data
-        raw_image = Image.open(requests.get("https://huggingface.co/ybelkada/segment-anything/resolve/main/assets/car.png", 
-                                            stream=True).raw).convert("RGB")
-        inputs = processor(raw_image, input_points=[[[450, 600]]], return_tensors="pt")
-
         signature = ModelSignature(inputs=input_schema, outputs=output_schema)
 
         # 6) Log Model to Artifact Store
         mlflow.tensorflow.log_model(model, 'model',
-                                    signature = signature,
-                                    input_example = inputs)
+                                    signature = signature)
 
-    #mlflow.end_run()
 
 # COMMAND ----------
         

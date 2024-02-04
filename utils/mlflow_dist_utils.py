@@ -75,3 +75,47 @@ def create_mlflow_run(is_chief: bool, is_lead: bool, parent_run_id: str) -> mlfl
         mlflow.tensorflow.autolog(disable=True)
 
     return active_run
+
+# Testing logging to same process
+
+def create_mlflow_run_same_id(is_chief: bool, is_lead: bool, parent_run_id: str) -> mlflow.entities.Run:
+
+    """
+    Attaches to existing run and logs all metrics if it is lead node otherwise just logs system metrics 
+     
+    If the process is identified as both chief and lead, it enables 
+    automatic logging of TensorFlow metrics. If the process is only a lead (not chief), 
+    it only logs system metrics.
+
+    (As of mlflow 2.10.0, this doesn't work well as all the system metrics will display on one chart rather
+    than one chart per node - this requires changes in the MLflow API to work well)
+    
+    Parameters:
+    - is_chief (bool): A flag indicating if the current process is the chief process.
+    - is_lead (bool): A flag indicating if the current process is a lead process. 
+                        A lead process can be a chief or any process designated for special tasks.
+    - parent_run_id (str): The ID of the parent MLflow run. This allows the new run to be nested or linked to an existing run.
+    
+    Returns:
+    - mlflow.entities.Run: An object representing the attached MLflow run. 
+                            This object contains details about the run, including its ID, status, and metadata.
+    
+    Raises:
+    - Exception: If MLflow is not properly configured or if there's an error in starting the run, an exception will be raised by the MLflow library.
+    
+    Example:
+    >>> run = create_mlflow_run(is_chief=True, is_lead=True, parent_run_id='12345')
+    >>> print(run.info.run_id)
+    """
+   
+    if is_chief and is_lead:
+        active_run = mlflow.start_run(log_system_metrics=True,
+                                      run_id=parent_run_id)
+        mlflow.tensorflow.autolog()
+
+    elif is_lead:
+        active_run = mlflow.start_run(log_system_metrics=True,
+                                      run_id=parent_run_id)
+        mlflow.tensorflow.autolog(disable=True)
+
+    return active_run
